@@ -208,10 +208,3 @@ func streamList(path string) (io.ReadCloser, error) {
 	}
 	return &multi{files: files}, nil
 }
-
-// PanicIf panics if error is not nil.
-func PanicIf(err error) {
-	if err != nil {
-		panic(err)
-	}
-}
