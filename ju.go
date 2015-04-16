@@ -78,9 +78,10 @@ func WriteJSONFile(fn string, o interface{}) error {
 //   ...
 //   EOF
 // Supported cases:
-//   1 - path is a file. Read stream of JSON objects from file. File may be gzipped. Extension must be ".json" or ".gz".
-//   2 - path is a directory. Read stream from all the files in that directory that have extension ".json" or ".gz".
-//   3 - path is a file with extension ".list" that contains a list of paths to json files. Read from all the files in the list.
+// (1) path is a file. Read stream of JSON objects from file. File may be gzipped. Extension must be ".json" or ".gz".
+// (2) path is a directory. Read stream from all the files in that directory that have extension ".json" or ".gz".
+// (3) path is a file with extension ".list" that contains a list of paths to json files. Read from all the files in the list.
+//
 // The return value is of type io.ReadCloser. It is the caller's responsibility to call Close on the ReadCloser when done.
 func JSONStreamer(path string) (io.ReadCloser, error) {
 
