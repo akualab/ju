@@ -8,6 +8,7 @@ package ju
 
 import (
 	"bufio"
+	"compress/gzip"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -77,26 +78,26 @@ func WriteJSONFile(fn string, o interface{}) error {
 //   ...
 //   EOF
 // Supported cases:
-//   1 - path is a file. Read stream of JSON objects from file.
-//   2 - path is a directory. Read stream from all the files in that directory that have extension ".json".
+//   1 - path is a file. Read stream of JSON objects from file. File may be gzipped. Extension must be ".json" or ".gz".
+//   2 - path is a directory. Read stream from all the files in that directory that have extension ".json" or ".gz".
 //   3 - path is a file with extension ".list" that contains a list of paths to json files. Read from all the files in the list.
-// The return value is of type io.ReadCloser, the caller is responsible for closing the JSONStreamer to release resources
-// using the Close() method.
+// The return value is of type io.ReadCloser. It is the caller's responsibility to call Close on the ReadCloser when done.
 func JSONStreamer(path string) (io.ReadCloser, error) {
 
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
+	ext := filepath.Ext(path)
 	switch {
 	case fi.IsDir():
 		return streamDir(path)
-	case filepath.Ext(path) == ".json":
+	case ext == ".json" || ext == ".gz":
 		return streamFile(path)
-	case filepath.Ext(path) == ".list":
+	case ext == ".list":
 		return streamList(path)
 	default:
-		return nil, fmt.Errorf("can't parse path to stream json objects - must be a dir or have extensions \".json\" or \".list\"")
+		return nil, fmt.Errorf("can't parse path [%s] - must be a dir or have extensions \".json\" or \".gz\" or \".list\"", path)
 	}
 }
 
@@ -105,7 +106,8 @@ func streamDir(path string) (io.ReadCloser, error) {
 	files := []string{}
 	filepath.Walk(path, func(fn string, info os.FileInfo, err error) error {
 
-		if filepath.Ext(fn) != ".json" {
+		ext := filepath.Ext(fn)
+		if ext != ".json" && ext != ".gz" {
 			return nil
 		}
 		files = append(files, fn)
@@ -116,22 +118,31 @@ func streamDir(path string) (io.ReadCloser, error) {
 }
 
 type multi struct {
-	files []string
-	idx   int
-	file  *os.File
+	files  []string
+	idx    int
+	reader io.ReadCloser
 }
 
 func (m *multi) Read(p []byte) (int, error) {
-
-	var err error
-	if m.file == nil {
-		m.file, err = os.Open(m.files[m.idx])
+	if m.idx >= len(m.files) {
+		return 0, io.EOF
+	}
+	if m.reader == nil {
+		f, err := os.Open(m.files[m.idx])
 		if err != nil {
 			return 0, err
 		}
+		if filepath.Ext(m.files[m.idx]) == ".gz" {
+			m.reader, err = NewGZIPReader(f)
+			if err != nil {
+				return 0, err
+			}
+		} else {
+			m.reader = f
+		}
 		m.idx++
 	}
-	n, e := m.file.Read(p)
+	n, e := m.reader.Read(p)
 	switch {
 
 	case e == nil:
@@ -139,26 +150,26 @@ func (m *multi) Read(p []byte) (int, error) {
 		return n, nil
 
 	case e == io.EOF && m.idx < len(m.files):
-		// End of file but we have more files.
-		err := m.file.Close()
+		// End of reader but we have more files.
+		err := m.reader.Close()
 		if err != nil {
 			return n, err
 		}
-		m.file = nil
+		m.reader = nil
 		return n, nil // we are not done yet!
 
 	case e == io.EOF:
-		// End of last file.
-		err := m.file.Close()
+		// End of last reader.
+		err := m.reader.Close()
 		if err != nil {
 			return 0, err
 		}
-		m.file = nil
+		m.reader = nil
 		return n, io.EOF // we are done!
 
 	default:
 		// Some unknown error.
-		err := m.file.Close()
+		err := m.reader.Close()
 		if err != nil {
 			return 0, err
 		}
@@ -170,8 +181,8 @@ func (m *multi) Read(p []byte) (int, error) {
 func (m *multi) Close() error {
 	m.idx = 0
 	m.files = nil
-	if m.file != nil {
-		err := m.file.Close()
+	if m.reader != nil {
+		err := m.reader.Close()
 		if err != nil {
 			return err
 		}
@@ -183,6 +194,13 @@ func streamFile(path string) (io.ReadCloser, error) {
 	f, e := os.Open(path)
 	if e != nil {
 		return nil, e
+	}
+	if filepath.Ext(path) == ".gz" {
+		r, err := NewGZIPReader(f)
+		if err != nil {
+			return nil, err
+		}
+		return r, nil
 	}
 	return f, nil
 }
@@ -198,8 +216,9 @@ func streamList(path string) (io.ReadCloser, error) {
 	files := []string{}
 	for scanner.Scan() {
 		line := scanner.Text()
-		if filepath.Ext(line) != ".json" {
-			return nil, fmt.Errorf("in list [%s] found a line without a .json extension: %s", path, line)
+		ext := filepath.Ext(line)
+		if ext != ".json" && ext != ".gz" {
+			return nil, fmt.Errorf("in list [%s] found a line without a .json or .gz extension: %s", path, line)
 		}
 		files = append(files, line)
 	}
@@ -207,4 +226,40 @@ func streamList(path string) (io.ReadCloser, error) {
 		return nil, err
 	}
 	return &multi{files: files}, nil
+}
+
+// GZIPReader is a wrapper to read compressed gzip files.
+type GZIPReader struct {
+	inReader   io.ReadCloser
+	gzipReader *gzip.Reader
+}
+
+// NewGZIPReader creates a new GZIPReader that reads from r.
+// The return value implements io.ReadCloser. It is the caller's responsibility to call Close when done.
+func NewGZIPReader(r io.ReadCloser) (*GZIPReader, error) {
+	gr := &GZIPReader{inReader: r}
+	var err error
+	gr.gzipReader, err = gzip.NewReader(gr.inReader)
+	if err != nil {
+		return nil, err
+	}
+	return gr, nil
+}
+
+// Read implements the io.Read interface.
+func (g *GZIPReader) Read(p []byte) (int, error) {
+	return g.gzipReader.Read(p)
+}
+
+// Close closes the gzip reader and the wrapped reader.
+func (g *GZIPReader) Close() error {
+
+	if g.inReader != nil {
+		err := g.inReader.Close()
+		if err != nil {
+			return err
+		}
+	}
+	err := g.gzipReader.Close()
+	return err
 }
