@@ -431,7 +431,10 @@ func TestJSONStreamer(t *testing.T) {
 	}
 
 	// test dir
-	js := NewJSONStreamer(dir)
+	js, err := NewJSONStreamer(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for i := 0; ; i++ {
 		var o tt
 		e := js.Next(&o)

@@ -84,17 +84,17 @@ type JSONStreamer struct {
 }
 
 // NewJSONStreamer creates a new streamer to read json objects.
-// See FileStreamer to specify the path and ext parameters.
-func NewJSONStreamer(path string, ext ...string) *JSONStreamer {
-	fs, err := FileStreamer(path, ext...)
+// See FileStreamer to specify the path.
+func NewJSONStreamer(path string) (*JSONStreamer, error) {
+	fs, err := FileStreamer(path, ".json")
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	js := &JSONStreamer{
 		fs:  fs,
 		dec: json.NewDecoder(fs),
 	}
-	return js
+	return js, nil
 }
 
 // Next returns the next JSON object.
@@ -115,7 +115,7 @@ func (js *JSONStreamer) Close() error {
 // FileStreamer returns a reader that streams data from multiple files. The list of files can be specified in multiple ways:
 // (1) path is a single file. The file may be gzipped in which case the name extension must be ".gz".
 // (2) path is a directory. Reads from all the files in that directory such that (a) the filename must not start with a period,
-// (b) the filename has extension ".gz", (c) the "ext" parameter is empty or the allowed extensions are listed.
+// (b) the filename has extension ".gz", (c) the "ext" parameter is empty or the allowed extensions are listed, (d) path is not a symboic link.
 // (3) path is a file with extension ".list" that contains a list of paths to files. Read from all the files in the list.
 //
 // The return value is of type io.ReadCloser. It is the caller's responsibility to call Close on the ReadCloser when done.
