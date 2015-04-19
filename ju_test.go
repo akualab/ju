@@ -73,7 +73,7 @@ func TestStreamFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	reader, err := JSONStreamer(fn)
+	reader, err := FileStreamer(fn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,7 +99,7 @@ func TestStreamFile(t *testing.T) {
 	}
 
 	// gzip test
-	reader, err = JSONStreamer(zfn)
+	reader, err = FileStreamer(zfn)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,7 +187,7 @@ func TestStreamDir(t *testing.T) {
 	listFilez.Close()
 
 	// test dir
-	reader, err := JSONStreamer(dir)
+	reader, err := FileStreamer(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -212,7 +212,7 @@ func TestStreamDir(t *testing.T) {
 	}
 
 	// test list
-	reader, err = JSONStreamer(listFN)
+	reader, err = FileStreamer(listFN)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -237,7 +237,7 @@ func TestStreamDir(t *testing.T) {
 	}
 
 	// test gzip dir
-	reader, err = JSONStreamer(zdir)
+	reader, err = FileStreamer(zdir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -262,7 +262,7 @@ func TestStreamDir(t *testing.T) {
 	}
 
 	// test gzip list
-	reader, err = JSONStreamer(listFNz)
+	reader, err = FileStreamer(listFNz)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -282,6 +282,171 @@ func TestStreamDir(t *testing.T) {
 		}
 	}
 	e = reader.Close()
+	if e != nil {
+		t.Fatal(e)
+	}
+
+}
+
+func TestExtensions(t *testing.T) {
+
+	base := filepath.Join(os.TempDir())
+	dir := filepath.Join(base, "ext")
+	e := os.MkdirAll(dir, 0777)
+	if e != nil {
+		t.Fatal(e)
+	}
+
+	name := "test.x1"
+	fn := filepath.Join(dir, name)
+	t.Log("writing to file: ", fn)
+	f, err := os.Create(fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x := tt{Name: name, N: 1}
+	WriteJSON(f, &x)
+	f.Close()
+
+	name = "test.x2"
+	fn = filepath.Join(dir, name)
+	t.Log("writing to file: ", fn)
+	f, err = os.Create(fn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	x = tt{Name: name, N: 1}
+	WriteJSON(f, &x)
+	f.Close()
+
+	// test dir
+	reader, err := FileStreamer(dir, "x1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec := json.NewDecoder(reader)
+	i := 0
+	for i = 0; ; i++ {
+		var o tt
+		e := dec.Decode(&o)
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			t.Fatal(e)
+		}
+		if o.Name != "test.x1" {
+			t.Logf("expected %s, got %s", "test.x1", o.Name)
+		}
+		t.Log(i, "read back:", o)
+	}
+	if i != 1 {
+		t.Fatalf("expected to read 1 file, got %d", i)
+	}
+
+	e = reader.Close()
+	if e != nil {
+		t.Fatal(e)
+	}
+
+	reader, err = FileStreamer(dir, "x2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec = json.NewDecoder(reader)
+	i = 0
+	for ; ; i++ {
+		var o tt
+		e := dec.Decode(&o)
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			t.Fatal(e)
+		}
+		if o.Name != "test.x2" {
+			t.Logf("expected %s, got %s", "test.x2", o.Name)
+		}
+		t.Log(i, "read back:", o)
+	}
+	if i != 1 {
+		t.Fatalf("expected to read 1 file, got %d", i)
+	}
+	e = reader.Close()
+	if e != nil {
+		t.Fatal(e)
+	}
+
+	reader, err = FileStreamer(dir, "xxx")
+	if err != nil {
+		t.Fatal(err)
+	}
+	dec = json.NewDecoder(reader)
+	i = 0
+	for ; ; i++ {
+		var o tt
+		e := dec.Decode(&o)
+		if e == io.EOF {
+			break
+		}
+		if e != nil {
+			t.Fatal(e)
+		}
+	}
+	if i != 0 {
+		t.Fatalf("expected to read 0 file, got %d", i)
+	}
+	e = reader.Close()
+	if e != nil {
+		t.Fatal(e)
+	}
+
+}
+
+func TestJSONStreamer(t *testing.T) {
+
+	ref := []tt{}
+	base := filepath.Join(os.TempDir())
+	dir := filepath.Join(base, "sd")
+	e := os.MkdirAll(dir, 0777)
+	if e != nil {
+		t.Fatal(e)
+	}
+	for k := 0; k < 10; k++ {
+		fn := filepath.Join(dir, fmt.Sprintf("testfile-%d.json", k))
+		t.Log("writing to file: ", fn)
+		f, err := os.Create(fn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		words := []string{}
+		for i := 0; i < 10; i++ {
+			words = append(words, fmt.Sprintf("numero %d", i))
+			name := fmt.Sprintf("test file # %d, object # %d", k, i)
+			x := tt{Name: name, N: i, Words: words}
+			ref = append(ref, x)
+			WriteJSON(f, &x)
+		}
+		f.Close()
+	}
+
+	// test dir
+	js := NewJSONStreamer(dir)
+	for i := 0; ; i++ {
+		var o tt
+		e := js.Next(&o)
+		if e == Done {
+			break
+		}
+		if e != nil {
+			t.Fatal(e)
+		}
+		t.Log(i, "json streamer read back:", o)
+		if !ref[i].equal(o) {
+			t.Fatalf("mismatch, expected %v, got %v", ref[i], o)
+		}
+	}
+	e = js.Close()
 	if e != nil {
 		t.Fatal(e)
 	}

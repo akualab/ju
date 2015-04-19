@@ -10,11 +10,16 @@ import (
 	"bufio"
 	"compress/gzip"
 	"encoding/json"
-	"fmt"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 )
+
+// Done is returned as the error value when there are no more objects to process.
+var Done = errors.New("no more json objects")
 
 // ReadJSON unmarshals json data from an io.Reader.
 // The param "o" must be a pointer to an object.
@@ -72,49 +77,99 @@ func WriteJSONFile(fn string, o interface{}) error {
 	return e
 }
 
-// JSONStreamer returns a reader that returns JSON objects read from a file or from multiple files. JSON objects are stored as follows:
-//   {"example":11, "any":"json"}
-//   {"example":12, "any":"json"}
-//   ...
-//   EOF
-// Supported cases:
-// (1) path is a file. Read stream of JSON objects from file. File may be gzipped. Extension must be ".json" or ".gz".
-// (2) path is a directory. Read stream from all the files in that directory that have extension ".json" or ".gz".
-// (3) path is a file with extension ".list" that contains a list of paths to json files. Read from all the files in the list.
+// JSONStreamer will unmarshal a stream of JSON objects.
+type JSONStreamer struct {
+	fs  io.ReadCloser
+	dec *json.Decoder
+}
+
+// NewJSONStreamer creates a new streamer to read json objects.
+// See FileStreamer to specify the path and ext parameters.
+func NewJSONStreamer(path string, ext ...string) *JSONStreamer {
+	fs, err := FileStreamer(path, ext...)
+	if err != nil {
+		return nil
+	}
+	js := &JSONStreamer{
+		fs:  fs,
+		dec: json.NewDecoder(fs),
+	}
+	return js
+}
+
+// Next returns the next JSON object.
+// When there are no more results, Done is returned as the error.
+func (js *JSONStreamer) Next(dst interface{}) error {
+	e := js.dec.Decode(dst)
+	if e == io.EOF {
+		return Done
+	}
+	return e
+}
+
+// Close the JSON streamer. Will close the underlyign readers.
+func (js *JSONStreamer) Close() error {
+	return js.fs.Close()
+}
+
+// FileStreamer returns a reader that streams data from multiple files. The list of files can be specified in multiple ways:
+// (1) path is a single file. The file may be gzipped in which case the name extension must be ".gz".
+// (2) path is a directory. Reads from all the files in that directory such that (a) the filename must not start with a period,
+// (b) the filename has extension ".gz", (c) the "ext" parameter is empty or the allowed extensions are listed.
+// (3) path is a file with extension ".list" that contains a list of paths to files. Read from all the files in the list.
 //
 // The return value is of type io.ReadCloser. It is the caller's responsibility to call Close on the ReadCloser when done.
-func JSONStreamer(path string) (io.ReadCloser, error) {
-
+func FileStreamer(path string, ext ...string) (io.ReadCloser, error) {
+	r, e := regexp.Compile("^[^.].*[.][[:alnum:]]+")
+	if e != nil {
+		return nil, e
+	}
+	allowed := map[string]bool{".gz": true}
+	for _, v := range ext {
+		if !strings.HasPrefix(v, ".") {
+			v = "." + v
+		}
+		allowed[v] = true
+	}
 	fi, err := os.Stat(path)
 	if err != nil {
 		return nil, err
 	}
-	ext := filepath.Ext(path)
+	fext := filepath.Ext(path)
 	switch {
 	case fi.IsDir():
-		return streamDir(path)
-	case ext == ".json" || ext == ".gz":
-		return streamFile(path)
-	case ext == ".list":
+		return streamDir(path, allowed, r)
+	case fext == ".list":
 		return streamList(path)
 	default:
-		return nil, fmt.Errorf("can't parse path [%s] - must be a dir or have extensions \".json\" or \".gz\" or \".list\"", path)
+		return streamFile(path)
 	}
 }
 
-func streamDir(path string) (io.ReadCloser, error) {
+func matchExt(ext string, allowed map[string]bool) bool {
+	if len(allowed) == 1 {
+		return true
+	}
+	_, ok := allowed[ext]
+	if ok {
+		return true
+	}
+	return false
+}
 
+func streamDir(path string, allowed map[string]bool, r *regexp.Regexp) (io.ReadCloser, error) {
 	files := []string{}
 	filepath.Walk(path, func(fn string, info os.FileInfo, err error) error {
-
+		if !r.MatchString(filepath.Base(fn)) {
+			return nil
+		}
 		ext := filepath.Ext(fn)
-		if ext != ".json" && ext != ".gz" {
+		if !matchExt(ext, allowed) {
 			return nil
 		}
 		files = append(files, fn)
 		return nil
 	})
-
 	return &multi{files: files}, nil
 }
 
@@ -125,7 +180,7 @@ type multi struct {
 }
 
 func (m *multi) Read(p []byte) (int, error) {
-	if m.idx >= len(m.files) {
+	if len(m.files) == 0 {
 		return 0, io.EOF
 	}
 	if m.reader == nil {
@@ -217,10 +272,6 @@ func streamList(path string) (io.ReadCloser, error) {
 	files := []string{}
 	for scanner.Scan() {
 		line := scanner.Text()
-		ext := filepath.Ext(line)
-		if ext != ".json" && ext != ".gz" {
-			return nil, fmt.Errorf("in list [%s] found a line without a .json or .gz extension: %s", path, line)
-		}
 		files = append(files, line)
 	}
 	if err := scanner.Err(); err != nil {
