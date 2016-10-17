@@ -184,6 +184,10 @@ func (m *multi) Read(p []byte) (int, error) {
 		return 0, io.EOF
 	}
 	if m.reader == nil {
+		// Edge case, calling Read after last reader is closed.
+		if m.idx >= len(m.files) {
+			return 0, io.EOF
+		}
 		f, err := os.Open(m.files[m.idx])
 		if err != nil {
 			return 0, err
