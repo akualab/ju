@@ -12,10 +12,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"strings"
+	"sync"
 )
 
 // Done is returned as the error value when there are no more objects to process.
@@ -112,14 +115,10 @@ func (js *JSONStreamer) Close() error {
 	return js.fs.Close()
 }
 
-// FileStreamer returns a reader that streams data from multiple files. The list of files can be specified in multiple ways:
-// (1) path is a single file. The file may be gzipped in which case the name extension must be ".gz".
-// (2) path is a directory. Reads from all the files in that directory such that (a) the filename must not start with a period,
-// (b) the filename has extension ".gz", (c) the "ext" parameter is empty or the allowed extensions are listed, (d) path is not a symboic link.
-// (3) path is a file with extension ".list" that contains a list of paths to files. Read from all the files in the list.
-//
-// The return value is of type io.ReadCloser. It is the caller's responsibility to call Close on the ReadCloser when done.
-func FileStreamer(path string, ext ...string) (io.ReadCloser, error) {
+// We can pass a list of files in various ways. See FileStreamer documentation.
+// This function returns a slice of file paths.
+func extractPaths(path string, ext ...string) ([]string, error) {
+	files := []string{}
 	r, e := regexp.Compile("^[^.].*[.][[:alnum:]]+")
 	if e != nil {
 		return nil, e
@@ -138,12 +137,52 @@ func FileStreamer(path string, ext ...string) (io.ReadCloser, error) {
 	fext := filepath.Ext(path)
 	switch {
 	case fi.IsDir():
-		return streamDir(path, allowed, r)
+		filepath.Walk(path, func(fn string, info os.FileInfo, err error) error {
+			if !r.MatchString(filepath.Base(fn)) {
+				return nil
+			}
+			ext := filepath.Ext(fn)
+			if !matchExt(ext, allowed) {
+				return nil
+			}
+			files = append(files, fn)
+			return nil
+		})
+
 	case fext == ".list":
-		return streamList(path)
+		f, e := os.Open(path)
+		if e != nil {
+			return nil, e
+		}
+		defer f.Close()
+		scanner := bufio.NewScanner(f)
+		files := []string{}
+		for scanner.Scan() {
+			line := scanner.Text()
+			files = append(files, line)
+		}
+		if err := scanner.Err(); err != nil {
+			return nil, err
+		}
 	default:
-		return streamFile(path)
+		files = append(files, path)
 	}
+	return files, nil
+}
+
+// FileStreamer returns a reader that streams data from multiple files. The list of files can be specified in multiple ways:
+// (1) path is a single file. The file may be gzipped in which case the name extension must be ".gz".
+// (2) path is a directory. Reads from all the files in that directory such that (a) the filename must not start with a period,
+// (b) the filename has extension ".gz", (c) the "ext" parameter is empty or the allowed extensions are listed, (d) path is not a symboic link.
+// (3) path is a file with extension ".list" that contains a list of paths to files. Read from all the files in the list.
+//
+// The return value is of type io.ReadCloser. It is the caller's responsibility to call Close on the ReadCloser when done.
+func FileStreamer(path string, ext ...string) (io.ReadCloser, error) {
+	paths, err := extractPaths(path, ext...)
+	if err != nil {
+		return nil, err
+	}
+	return &multi{files: paths}, nil
 }
 
 func matchExt(ext string, allowed map[string]bool) bool {
@@ -155,22 +194,6 @@ func matchExt(ext string, allowed map[string]bool) bool {
 		return true
 	}
 	return false
-}
-
-func streamDir(path string, allowed map[string]bool, r *regexp.Regexp) (io.ReadCloser, error) {
-	files := []string{}
-	filepath.Walk(path, func(fn string, info os.FileInfo, err error) error {
-		if !r.MatchString(filepath.Base(fn)) {
-			return nil
-		}
-		ext := filepath.Ext(fn)
-		if !matchExt(ext, allowed) {
-			return nil
-		}
-		files = append(files, fn)
-		return nil
-	})
-	return &multi{files: files}, nil
 }
 
 type multi struct {
@@ -265,25 +288,6 @@ func streamFile(path string) (io.ReadCloser, error) {
 	return f, nil
 }
 
-func streamList(path string) (io.ReadCloser, error) {
-
-	f, e := os.Open(path)
-	if e != nil {
-		return nil, nil
-	}
-	defer f.Close()
-	scanner := bufio.NewScanner(f)
-	files := []string{}
-	for scanner.Scan() {
-		line := scanner.Text()
-		files = append(files, line)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return &multi{files: files}, nil
-}
-
 // GZIPReader is a wrapper to read compressed gzip files.
 type GZIPReader struct {
 	inReader   io.ReadCloser
@@ -318,4 +322,121 @@ func (g *GZIPReader) Close() error {
 	}
 	err := g.gzipReader.Close()
 	return err
+}
+
+// ReadJSONParallel creates a new streamer to read json objects.
+// See FileStreamer to specify the path.
+// Run it on a seprate goroutine.
+func ReadJSONParallel(path string, obj interface{}, objCh chan interface{}, numWorkers int) {
+
+	// List of filel paths.
+	paths, err := extractPaths(path, ".json")
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// We need to know when all workers finish doing the work.
+	var wg sync.WaitGroup
+	wg.Add(numWorkers)
+	log.Printf("starting %d workers", numWorkers)
+	pathCh := make(chan string, 10)
+
+	// Do the work concurrently in the background.
+	for w := 0; w < numWorkers; w++ {
+		go func() {
+			worker(obj, pathCh, objCh)
+			wg.Done()
+		}()
+	}
+
+	// Push paths into channel so workers can do their job concurrently.
+	for _, v := range paths {
+		pathCh <- v
+	}
+	// Signal that all work is in the channel.
+	close(pathCh)
+
+	// Wait for all workers to finish.
+	wg.Wait()
+	close(objCh)
+}
+
+func worker(obj interface{}, pathCh chan string, objCh chan interface{}) {
+
+	for {
+		path, more := <-pathCh
+		if !more {
+			return
+		}
+		reader, err := streamFile(path)
+		if err != nil {
+			log.Fatalln("worker error when processing file ", path)
+		}
+		dec := json.NewDecoder(reader)
+		n := 0
+		for {
+			val := reflect.ValueOf(obj)
+			val = reflect.Indirect(val)
+			x := reflect.New(val.Type()).Interface()
+			e := dec.Decode(x)
+			if e == io.EOF {
+				// log.Printf("read %8d records from file %s", n, path)
+				break
+			}
+			objCh <- x
+			n++
+		}
+	}
+}
+
+// Writer writes json objects.
+type Writer struct {
+	writer io.WriteCloser
+	path   string
+	enc    *json.Encoder
+}
+
+// NewWriter writes graphs to files.
+// path is the filename, if the ext is "gz", the data is gzipped.
+func NewWriter(path string) (*Writer, error) {
+
+	writer := &Writer{
+		path: path,
+	}
+	e := os.MkdirAll(filepath.Dir(path), 0755)
+	if e != nil {
+		return nil, e
+	}
+	w, e := os.Create(path)
+	if e != nil {
+		return nil, e
+	}
+
+	writer.enc = json.NewEncoder(w)
+	writer.writer = w
+	if filepath.Ext(path) == ".gz" {
+		gz := gzip.NewWriter(w)
+		writer.enc = json.NewEncoder(gz)
+		writer.writer = gz
+	}
+
+	return writer, nil
+}
+
+// WriteJSON writes a json object.
+func (w *Writer) Write(o interface{}) error {
+
+	err := w.enc.Encode(o)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+// Close closes the writer.
+func (w *Writer) Close() error {
+	if w.writer != nil {
+		return w.writer.Close()
+	}
+	return nil
 }
