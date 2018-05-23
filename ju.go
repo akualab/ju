@@ -8,7 +8,6 @@ package ju
 
 import (
 	"bufio"
-	"compress/gzip"
 	"encoding/json"
 	"errors"
 	"io"
@@ -19,6 +18,8 @@ import (
 	"regexp"
 	"strings"
 	"sync"
+
+	gzip "github.com/klauspost/pgzip"
 )
 
 // Done is returned as the error value when there are no more objects to process.
